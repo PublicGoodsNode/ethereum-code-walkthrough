@@ -1,6 +1,6 @@
 # Geth 源码系列：存储设计及实现
 
-Author: Po
+Author: Po (X: @sanemindpeace)
 
 这篇文章是 Geth 源码系列的第二篇，通过这个系列，我们将搭建一个研究 Geth 实现的框架，开发者可以根据这个框架深入自己感兴趣的部分研究。这个系列共有六篇文章，在这第二篇文章中，将系统讲解 Geth 的存储结构设计与相关源码，介绍其数据库层次划分并详细分析各个层次中相应模块的核心功能。
 
@@ -8,7 +8,7 @@ Author: Po
 
 # 1. Geth底层数据库总览
 
-自 Geth v1.9.0 版本起，Geth 将其数据库分为两部分：**快速访问存储**（KV数据库，用于最近的区块和状态数据）和称为 **freezer 的存储**（用于较旧的区块和收据数据，即“ancients”）。
+自 [Geth v1.9.0 版本起](https://blog.ethereum.org/2019/07/10/geth-v1-9-0)，Geth 将其数据库分为两部分：**快速访问存储**（KV数据库，用于最近的区块和状态数据）和称为 **freezer 的存储**（用于较旧的区块和收据数据，即“ancients”）。
 
 这样划分的目的是减少对昂贵、易损的 SSD 的依赖，将访问频率较低的数据迁移到成本更低、耐用性更高的磁盘上。与此同时，这种拆分也能减轻 LevelDB/PebbleDB 的压力，提高其整理和读取性能，使得在给定的缓存大小下，更多状态树节点能够常驻内存，从而提升整体系统效率。
 
@@ -73,9 +73,9 @@ Geth 的底层使用 LevelDB/PebbleDB 存储所有以 [RLP](https://ethereum.org
 +-----------------------+-----------------------------+------------+------------+
 ```
 
-# 2. 源码视角下的存储分层: 6种DB
+# 2. 源码视角下的存储分层: 7种DB
 
-总体而言，Geth 中包含 `StateDB`、`state.Database`、`trie.Trie`、`TrieDB`、`rawdb` 和 `ethdb` 六个数据库模块，它们如同一棵“状态生命树”的各个层级。最顶层的 `StateDB` 是 EVM 执行阶段的状态接口，负责处理账户与存储的读写请求，并将这些请求逐层下传，最终由最底层负责物理持久化的 `ethdb` 读/写物理数据库。
+总体而言，Geth 中包含 `StateDB`、`state.Database`、`trie.Trie`、`TrieDB`、`Snapshot`、`rawdb` 和 `ethdb` 七个数据库模块，它们如同一棵“状态生命树”的各个层级。最顶层的 `StateDB` 是 EVM 执行阶段的状态接口，负责处理账户与存储的读写请求，并将这些请求逐层下传，最终由最底层负责物理持久化的 `ethdb` 读/写物理数据库。
 
 接下来，我们将依次介绍这六个数据库模块的职责及它们之间的协作关系。
 
@@ -87,27 +87,29 @@ Geth 的底层使用 LevelDB/PebbleDB 存储所有以 [RLP](https://ethereum.org
 
 源码中，`StateDB` 的主要定义位于 `core/state/statedb.go`。它的核心结构维护了一系列内存状态对象（`stateObject`），每个`stateObject`对应一个账户（包含合约存储）。它还包含一个 `journal`（事务日志）用于支持回滚，以及用于追踪状态更改的缓存机制。在交易处理和区块打包过程中，`StateDB` 提供临时状态变更的记录，只有在最终确认后才会写入底层数据库。
 
-`StateDB` 的核心读写接口如下，基本都是账户模型相关的API:
+`StateDB` 的核心读写接口如下，基本都是账户模型[相关的API](https://github.com/ethereum/go-ethereum/blob/d121c27acefb96b875f7d3047dd26e0b83862d59/core/vm/interface.go#L31):
 
 ```go
 // 读相关
 func (s *StateDB) GetBalance(addr common.Address) *uint256.Int 
-func (s *StateDB) GetStorageRoot(addr common.Address) common.Hash 
+func (s *StateDB) GetStorageRoot(addr common.Address) common.Hash
+...
 // 写入dirty状态数据
 func (s *StateDB) SetStorage(addr common.Address, storage map[common.Hash]common.Hash) 
 // 将EVM执行过程中发生的状态变更(dirty数据) commit到后端数据库中
-func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (*stateUpdate, error) 
+func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (*stateUpdate, error)
+...
 ```
 
 ### **生命周期**
 
 `StateDB`的生命周期只持续一个区块。在一个区块被处理并提交之后，这个 `StateDB` 就会被废弃，不再具有作用
 
-- EVM 第一次读取某个地址时，`StateDB` 会从`Trie→TrieDB→EthDB`数据库中加载它的值，并将其缓存一个新的状态对象（`stateObject.originalStorage`）中。这一阶段被视为“干净的对象”（clean object）。
+- EVM 第一次读取某个地址时，`StateDB` 会从`Snapshot->EthDB`或`Trie→TrieDB→EthDB`(默认选择[Snapshot](#25-snapshot)，如果Snapshot损坏则采用TrieDB)数据库中加载它的值，并将其缓存一个新的状态对象（`stateObject.originalStorage`）中。这一阶段被视为“干净的对象”（clean object）。
 - 当交易与该账户发生交互并改变其状态时，对象就变成“脏的”（dirty）。`stateObject`会同时追踪该账户的原始状态和所有修改后的数据，包括其存储槽及其干净/脏状态。
 - 如果整个交易最终成功被打包到区块，`StateDB.Finalise()` 会被调用。这个函数负责清理已 `selfdestruct` 的合约，并重置 journal（事务日志）以及 gas refund 计数器。
 - 当所有交易都执行完毕后，`StateDB.Commit()` 被调用。在这之前，状态树`Trie`实际上还未被更改。直到这一步，`StateDB` 才会将内存中的状态变更写入存储 `Trie`，计算出每个账户的最终 storage root，从而生成账户的最终状态。接下来，所有“脏”的状态对象会被写入 `Trie`中，更新其结构并计算新的 `stateRoot`。
-- 最后，这些更新后的节点会被传递给 `TrieDB`，它会根据不同的后端（PathDB/HashDB）缓存这些节点，并最终将它们持久化到磁盘（LevelDB/PebbleDB）——前提是这些数据没有因为链重组被丢弃。
+- 最后，这些更新后的节点会被传递给 `Snapshot`和`TrieDB`，它会根据不同的`TrieDB`后端（PathDB/HashDB）缓存这些节点，并最终将它们持久化到磁盘（LevelDB/PebbleDB）——前提是这些数据没有因为链重组被丢弃。
 
 ## 2.2 State.Database
 
@@ -119,14 +121,24 @@ func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorag
 
 - **提供统一的状态访问接口**
 
-`state.Database` 是构建 `StateDB` 的必要依赖，它封装了打开账户 Trie 和存储 Trie 的逻辑，例如：
+`state.Database` 是构建 `StateDB` 的必要依赖，它封装了打开账户 Trie 、存储 Trie和Snapshot 的逻辑，例如：
 
 ```go
-func (db *cachingDB) OpenTrie(root common.Hash) (Trie, error)
-func (db *cachingDB) OpenStorageTrie(stateRoot common.Hash, address common.Address, root common.Hash, trie Trie) (Trie, error)
+// Reader returns a state reader associated with the specified state root.
+Reader(root common.Hash) (Reader, error)
+// OpenTrie opens the main account trie.
+OpenTrie(root common.Hash) (Trie, error)
+// OpenStorageTrie opens the storage trie of an account.
+OpenStorageTrie(stateRoot common.Hash, address common.Address, root common.Hash, trie Trie) (Trie, error)
+// PointCache returns the cache holding points used in verkle tree key computation
+PointCache() *utils.PointCache
+// TrieDB returns the underlying trie database for managing trie nodes.
+TrieDB() *triedb.Database
+// Snapshot returns the underlying state snapshot.
+Snapshot() *snapshot.Tree
 ```
 
-这些方法隐藏了底层 `TrieDB` 的复杂性，开发者在构建某个区块的状态时，只需调用这些方法获取正确的 Trie 实例，而不必直接操作 hash 路径、trie 编码或底层数据库。
+这些方法隐藏了底层 `Snapshot`和`TrieDB` 的复杂性，开发者在构建某个区块的状态时，只需调用这些方法获取正确的状态Reader，而不必直接操作 hash 路径、trie 编码或底层数据库。
 
 - **暂存和复用合约代码（code cache）**
 
@@ -226,6 +238,8 @@ func (t *Trie) get(origNode node, key []byte, pos int) (value []byte, newnode no
 - **HashDB**：传统方式，以哈希为键。
 - **PathDB**：新引入的 Path-based 模型（Geth 1.14.0版本后默认配置），以路径信息作为键，优化了更新与修剪性能。
 
+两种DB存储数据是存储时不会直接用原始 key（例如账户地址、storage key）当作路径，而是先对原始 key 做一层 哈希（Keccak256）防止前缀攻击，保证 trie 的平衡性和查询效率。
+
 源码中，TrieDB 主要位于`triedb/database.go`。
 
 ### Trie 节点的读取逻辑
@@ -287,9 +301,83 @@ storage trie node key = Prefix(1byte) || account hash(32byte) || COMPACTed(node_
 - 被持久化的这棵 Trie 并非链的最新头部，而是落后头部**至少 128 个区块**。最近 128 个区块的 Trie 更改则分别存在内存中，用于应对短链重组（reorg）；
 - 如果出现更大的 reorg，`PathDB`会利用 freezer 中预存的每个区块的 state diff（状态差异）进行逆应用（rollback），将磁盘状态回滚至分叉点。
 
-## 2.5 RawDB
+## 2.5 Snapshot
+由于EVM执行过程时需要访问状态，如果直接采用`TrieDB`则需要log(n)的时间复杂度，因此Geth在[V1.9.0](https://github.com/ethereum/go-ethereum/pull/20152)引入了状态Snapshot，Snapshot本质上存储了:`account=>account state和account=>slot=>slot value`的flat映射关系，这样进行状态访问时只需要O(1)的时间复杂度。Geth现在默认开启了该选项，在Snapsync初步同步完成后或节点非平滑stop的情况下，根据磁盘的读写性能需要花3-9个小时来重新构建Snapshot.
 
-在 Geth 中，`rawdb` 是一个底层数据库读写模块，它直接封装了对状态、区块链数据、Trie 节点等核心数据的存取逻辑，是**整个存储系统的基础接口层**。它并不直接暴露给 EVM 或业务逻辑层，而是作为内部工具服务于如 `TrieDB`、`StateDB`、`BlockChain` 等模块的持久化操作。`rawdb` 和 `trie` 一样，并不直接存储数据本身，它们都是**对底层数据库的抽象封装层**，负责定义存取规则，而非执行最终的数据落盘或读取。可以把 `rawdb` 看作是 Geth 的“硬盘驱动器”，它定义了**所有核心链上数据的键值格式和访问接口**，负责确保不同模块可以统一、可靠地读写数据。虽然在直接开发中很少会使用它，但它是整个 Geth 存储层最基础、最关键的一环。
+## 核心功能
+源码中`Snapshot`主要位于`core/state/snapshot`。`Snapshot`提供了快速访问Account和Storage的接口:
+
+```go
+func (dl *diskLayer) Account(hash common.Hash) (*types.SlimAccount, error)
+func (dl *diskLayer) Storage(accountHash, storageHash common.Hash) ([]byte, error)
+```
+
+当EVM执行访问`StateDB`状态时，会通过多层的状态访问组件[`multiStateReader](https://github.com/ethereum/go-ethereum/blob/485ff4bbff83abbf27a82a5660545e713c992c3f/core/state/database.go#L184)优先访问`Snapshot`:
+```
+if db.snap != nil {
+		// If standalone state snapshot is available (hash scheme),
+		// then construct the legacy snap reader.
+		snap := db.snap.Snapshot(stateRoot)
+		if snap != nil {
+			readers = append(readers, newFlatReader(snap))
+		}
+	} else {
+		// If standalone state snapshot is not available, try to construct
+		// the state reader with database.
+		reader, err := db.triedb.StateReader(stateRoot)
+		if err == nil {
+			readers = append(readers, newFlatReader(reader)) // state reader is optional
+		}
+	}
+	tr, err := newTrieReader(stateRoot, db.triedb, db.pointCache)
+	if err != nil {
+		return nil, err
+	}
+	readers = append(readers, tr)
+
+	combined, err := newMultiStateReader(readers...)
+	if err != nil {
+		return nil, err
+	}
+	return newReader(newCachingCodeReader(db.disk, db.codeCache, db.codeSizeCache), combined), nil
+```
+
+为了便于short-reorg回滚状态和以及批量执行区块儿后写磁盘(节省每次区块执行后需要写磁盘的开销)，与`TrieDB`类似Geth也为`Snapshot`在内存中维护多层[`Difflayer`](https://github.com/ethereum/go-ethereum/blob/767c202e4779536f4d9d862080304f20d9514371/core/state/snapshot/difflayer.go#L93)，其存储了每个区块执行后变动的Account和Storage状态数据:
+```go
+type diffLayer struct {
+	origin *diskLayer // Base disk layer to directly use on bloom misses
+	parent snapshot   // Parent snapshot modified by this one, never nil
+	...
+	accountData map[common.Hash][]byte                 // Keyed accounts for direct retrieval (nil means deleted)
+	storageData map[common.Hash]map[common.Hash][]byte // Keyed storage slots for direct retrieval. one per account (nil means deleted)
+```
+
+EVM执行完区块后，则会更新`Snapshot`:
+- 如果`difflayer`不超过128层，则直接根据区块执行后变化的Account和Storage数据新建一层`difflayer`.
+- 否则，还需要把最后一层的`difflayer`提交到`Snapshot`底层数据库中。节点Stop时，会把128层的`difflayer`全部写入日志中，便于下次启动时直接恢复`Snapshot`.
+
+```go
+func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (*stateUpdate, error) {
+	...
+	// If snapshotting is enabled, update the snapshot tree with this new version
+	if snap := s.db.Snapshot(); snap != nil && snap.Snapshot(ret.originRoot) != nil {
+		start := time.Now()
+		if err := snap.Update(ret.root, ret.originRoot, ret.accounts, ret.storages); err != nil {
+			log.Warn("Failed to update snapshot tree", "from", ret.originRoot, "to", ret.root, "err", err)
+		}
+		// Keep 128 diff layers in the memory, persistent layer is 129th.
+		// - head layer is paired with HEAD state
+		// - head-1 layer is paired with HEAD-1 state
+		// - head-127 layer(bottom-most diff layer) is paired with HEAD-127 state
+		if err := snap.Cap(ret.root, TriesInMemory); err != nil {
+			log.Warn("Failed to cap snapshot tree", "root", ret.root, "layers", TriesInMemory, "err", err)
+		}
+		s.SnapshotCommits += time.Since(start)
+	}
+```
+## 2.6 RawDB
+
+在 Geth 中，`rawdb` 是一个底层数据库读写模块，它直接封装了对状态、区块链数据、Trie 节点等核心数据的存取逻辑，是**整个存储系统的基础接口层**。它并不直接暴露给 EVM 或业务逻辑层，而是作为内部工具服务于如 `TrieDB`、`StateDB`、`Snapshot`、`BlockChain` 等模块的持久化操作。`rawdb` 和 `trie` 一样，并不直接存储数据本身，它们都是**对底层数据库的抽象封装层**，负责定义存取规则，而非执行最终的数据落盘或读取。可以把 `rawdb` 看作是 Geth 的“硬盘驱动器”，它定义了**所有核心链上数据的键值格式和访问接口**，负责确保不同模块可以统一、可靠地读写数据。虽然在直接开发中很少会使用它，但它是整个 Geth 存储层最基础、最关键的一环。
 
 ### 核心功能
 
@@ -308,7 +396,7 @@ storage trie node key = Prefix(1byte) || account hash(32byte) || COMPACTed(node_
 - 基于`HashDB` 的 Trie 节点采用`rawdb.WriteLegacyTrieNode` 等方法负责将以 `(hash, rlp-encoded node)` 的形式写入数据库。
 - 基于`PathDB`的 Trie 节点则采用`WriteAccountTrieNode, WriteStorageTrieNode` 等方法将以`（path, rlp-encoded node)`的形式写入数据库。
 
-## 2.6 EthDB
+## 2.7 EthDB
 
 在 Geth 中，`ethdb` 是整个存储系统的核心抽象，它扮演着“生命之树”的角色——深深扎根于磁盘，向上传递支持至 `EVM` 与执行层各个组件。其主要目的是**屏蔽底层数据库实现的差异**，为整个 Geth 提供统一的键值读写接口。正因如此，Geth 在任意地方都不直接使用具体的数据库（如 LevelDB、PebbleDB、MemoryDB等），而是通过 `ethdb` 提供的接口进行数据访问。
 
@@ -339,23 +427,24 @@ type KeyValueStore interface {
 
 ### 生命周期与模块贯通
 
-每个 Geth 节点启动时，都会创建唯一的 `ethdb` 实例，这个对象贯穿程序始终，直到节点关闭。在结构设计上，它被注入到 `core.Blockchain` 中，进而传递到 `StateDB`、`TrieDB` 等模块，成为全局共享的数据访问入口。
+每个 Geth 节点启动时，都会创建唯一的 `ethdb` 实例，这个对象贯穿程序始终，直到节点关闭。在结构设计上，它被注入到 `core.Blockchain` 中，进而传递到 `StateDB`、`Snapshot`、`TrieDB` 等模块，成为全局共享的数据访问入口。
 
 正因为 `ethdb` 抽象了底层数据库细节，Geth 的其他组件才能专注于各自的业务逻辑，比如：
 
 - `StateDB` 只关心账户和存储槽；
+- `Snapshot`只关系直接查找Account和Storage的状态;
 - `TrieDB` 只关心如何存储和查找 Trie 节点；
 - `rawdb` 只关心如何组织链数据的键值布局；
 
 这些上层组件都无需感知数据是存在哪个具体数据库引擎里。
 
-# 3. 六种 DB 的创建顺序和调用链
+# 3. 七种 DB 的创建顺序和调用链
 
-本节从 Geth 节点启动开始，梳理这 6 种 DB 的启动流程和调用关系。
+本节从 Geth 节点启动开始，梳理这 7 种 DB 的启动流程和调用关系。
 
 ## 3.1 创建顺序：
 
-整体创建顺序为`ethdb → rawdb/TrieDB → state.Database → stateDB → trie`，源码中具体调用链如下:
+整体创建顺序为`ethdb → rawdb/TrieDB/Snapshot → state.Database → stateDB → trie`，源码中具体调用链如下:
 
 ```bash
 【节点初始化阶段】
@@ -375,8 +464,11 @@ trie.Database (TrieDB)
 └── trie.NewDatabase(ethdb)
 └── backend: pathdb.New(ethdb) / hashdb.New(ethdb)
 ↓
+Snapshot
+└── bc.snaps, _ = snapshot.New(snapconfig, bc.db, bc.triedb, head.Root)
+↓
 state.Database (cachingDB)
-└── state.NewDatabase(trieDB)
+└── bc.statedb = state.NewDatabase(bc.triedb, bc.snaps)
 ↓
 【区块处理阶段】
 chain.InsertChain
@@ -384,6 +476,7 @@ chain.InsertChain
 └── state.New(root, state.Database)
 ↓
 state.StateDB
+└── StateDB.reader = newMultiStateReader(snapShot, trieDB)
 └── stateDB.OpenTrie()
 └── stateDB.OpenStorageTrie()
 ↓
@@ -397,6 +490,7 @@ trie.Trie / SecureTrie
 | **ethdb.Database** | 节点初始化 | 程序全程 | 抽象底层存储，统一接口（LevelDB / PebbleDB / Memory） |
 | **rawdb** | 包裹 ethdb 调用 | 不存储数据本身 | 提供区块/receipt/总难度等链数据的读写接口 |
 | **TrieDB** | `core.NewBlockChain()` | 程序全程 | 缓存+持久化 PathDB/HashDB 节点 |
+| **Snapshot** | `core.NewBlockChain()` | 程序全程 | 缓存+持久化 Flat Account和Storage |
 | **state.Database** | `core.NewBlockChain()` | 程序全程 | 封装 TrieDB，合约代码缓存，后期支持 Verkle 迁移 |
 | **state.StateDB** | 每个区块执行前创建一次 | 区块执行期间 | 管理状态读写，计算状态根，记录状态变更 |
 | **trie.Trie** | 每次账户或slot访问时创建 | 临时，不存储数据本身 | 负责 Trie 结构修改和根哈希计算 |
@@ -417,13 +511,23 @@ trie.Trie / SecureTrie
     ```
     
     - 其中调用到的`trie.Commit`方法会把所有的节点（不论是short节点还是full节点）[塌缩为hash节点](https://github.com/ethereum/go-ethereum/blob/4dfec7e83e4634cc8ab254b4bdbe9e692142316b/trie/committer.go#L51)`t.root = **newCommitter**(nodes, t.tracer, collectLeaf).**Commit**(t.root, t.uncommitted > 100)`，并收集所有脏节点返回给 StateDB
-    - StateDB利用收集到的所有脏节点更新TrieDB缓存层：
+    - StateDB利用收集到的所有脏节点更新TrieDB和Snapshot缓存层：
         - `HashDB`在内存中维护了`dirties map[**common**.**Hash**]***cachedNode**`这个对象来缓存这些更新，并更新相应的trie节点引用，缓存有大小限制
-        - `PathDB`则在内存中维护了`tree ***layerTree**`  这个对象并增加一层diff来缓存这些更新，最多可缓存128层diff
+        - `PathDB`则在内存中为`TrieDB`维护了`tree ***layerTree**`  这个对象并增加一层diff来缓存这些更新，最多可缓存128层diff(最近的128层diff以journal形式保存，超过128层journal会将其保存在历史数据中，历史数据默认最多保存90k个块儿)
+        - `HashDB`和`PathDB`模式下都在内存中维护`Snapshot`的diffLayer来缓存Account和Storage的更新，同样最多可缓存128层diff(diff的历史数据以journal形式保存，最多保存128个块儿的数据)
     
     ```go
     func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (*stateUpdate, error) {
     		...
+		    // If snapshotting is enabled, update the snapshot tree with this new version
+    		if snap := s.db.Snapshot(); snap != nil && snap.Snapshot(ret.originRoot) != nil {
+				if err := snap.Update(ret.root, ret.originRoot, ret.accounts, ret.storages); err != nil {
+					log.Warn("Failed to update snapshot tree", "from", ret.originRoot, "to", ret.root, "err", err)
+				}
+				if err := snap.Cap(ret.root, TriesInMemory); err != nil {
+					log.Warn("Failed to cap snapshot tree", "root", ret.root, "layers", TriesInMemory, "err", err)
+				}
+			}
     		// If trie database is enabled, commit the state update as a new layer
     		if db := s.db.TrieDB(); db != nil {
     			start := time.Now()
@@ -503,24 +607,25 @@ HashDB read: 0xe9ce7770c224e563b0c407618b7b7d8614da3d5da89f3960a3bec97e78fc0ae0
 HashDB read: 0x2c7d134997a5c3e0bf47ff347479ee9318826f1c58689b3d9caeac77287c3af8
 ```
 
-总体来说，`PathDB`和`HashDB`均是保持Trie数据结构来存储状态数据，只是`PathDB`以Trie节点的`path`作为key，而`HashDB`则是以Trie节点值对应的hash作为key，两者均存储值相同均为Trie节点的值。
+总体来说，`PathDB`和`HashDB`均是保持Trie数据结构来存储状态数据，只是`PathDB`以Trie节点的`path`作为key，而`HashDB`则是以Trie节点值对应的hash作为key。对于中间节点，**PathDB** 存储 `(path, subpaths)`，而 **HashDB** 存储 `(hash, subhashes)`。对于叶子节点，**PathDB** 存储 `(path, value)`，**HashDB** 存储 `(hash, value)`。这里有一个简单的 Go 示例，演示了 [**PathDB**](https://github.com/dajuguan/lab/blob/main/eth/go/trie/pathdb.go) 和 [**HashDB**](https://github.com/dajuguan/lab/blob/main/eth/go/trie/hashdb.go) 的状态读取、更新和回滚操作。
+
 
 # 5. DB 相关读写操作流程追踪
 
 1. **交易执行阶段**
-- 所有账户和Storage值通过`StateDB.GetState`等方法经过`Trie→TrieDB(pathdb/hashdb)→RawDB→Level/PebbleDB`读取到StateDB内存中
+- 所有账户和Storage值通过`StateDB.GetState`等方法经过`Snapshot(或者Trie→TrieDB(pathdb/hashdb))→RawDB→Level/PebbleDB`读取到StateDB内存中
 - 随后EVM执行状态变更（如调用 `Statedb.SetBalance()` ）也保留在 StateDB 的内存中
     - 包括：余额变更、nonce 更新、storage 修改
 1. **单个区块执行完毕更新缓存**
 - 调用 `StateDB.Commit()` → 收集脏节点转化为修改的 Trie 节点组，并计算新 StateRoot
-- 内部调用 `Trie.Commit()` → 调用 `TrieDB.Update()`将更改保存在 TrieDB 缓存层
+- 内部调用 `Trie.Commit()` → 调用 `TrieDB.Update()`将更改保存在Snapshot和TrieDB 缓存层
     - PathDB 最多有 128 个块的 diff 缓存层限制
     - HashDB 的缓存层有大小限制
-    - 超过上述限制则进一步触发`TrieDB.Commit`实际落盘到底层数据库
+    - 超过上述限制则进一步触发`Snapshot`和`TrieDB`进行Commit实际落盘到底层数据库
 1. **单个区块执行完毕 Header / Receipts 提交：**
     - 除状态以外，区块头、body、交易回执等数据通过 `RawDB.Write*(ethdb)` 等接口写入 `ethdb`层
-2. **多个区块执行后缓存超限触发实际落盘TrieDB.Commit → batch → DB**
-    - 节点是归档节点node 或超过 flushInterval 或超过 TrieDB 的缓存限制或节点关闭前，开始触发commit，并最终落盘。如下是`PathDB`模式下落盘核心代码:
+2. **多个区块执行后缓存超限触发实际落盘Snapshot/TrieDB.Commit → batch → DB**
+    - 节点是归档节点node 或超过 flushInterval 或超过 Snapshot/TrieDB 的缓存限制或节点关闭前，开始触发commit，并最终落盘。如下是`PathDB`模式下落盘核心代码:
 
 ```go
 func (db *Database) commit(hash common.Hash, batch ethdb.Batch, uncacher *cleaner) error {
@@ -536,9 +641,9 @@ func (db *Database) commit(hash common.Hash, batch ethdb.Batch, uncacher *cleane
 
 # 6. 总结
 
-Geth 中的这 6 个数据库模块各自承担不同层级的职责，形成了一条自底向上的数据访问链。通过多层抽象与多级缓存，上层模块无需关心底层的具体实现，从而实现了底层存储引擎的可插拔性与较高的 I/O 性能。
+Geth 中的这 7 个数据库模块各自承担不同层级的职责，形成了一条自底向上的数据访问链。通过多层抽象与多级缓存，上层模块无需关心底层的具体实现，从而实现了底层存储引擎的可插拔性与较高的 I/O 性能。
 
-最底层的 `ethdb` 抽象了物理存储，屏蔽具体数据库类型，支持如 LevelDB、Pebble、RemoteDB 等多种后端；其上一层是 `rawdb`，负责对区块、区块头、交易等核心链上数据结构的编码、解码与封装，简化了链数据的读写操作。`TrieDB` 管理状态树节点的缓存与持久化，支持 `hashdb` 与 `pathdb` 两种后端，用于实现不同的状态修剪策略和存储方式。
+最底层的 `ethdb` 抽象了物理存储，屏蔽具体数据库类型，支持如 LevelDB、Pebble、RemoteDB 等多种后端；其上一层是 `rawdb`，负责对区块、区块头、交易等核心链上数据结构的编码、解码与封装，简化了链数据的读写操作。`Snapshot`管理flat Account和Storage，便于EVM执行时快速读取状态。`TrieDB` 管理状态树节点的缓存与持久化，支持 `hashdb` 与 `pathdb` 两种后端，用于实现不同的状态修剪策略和存储方式。
 
 再往上，`trie.Trie` 是状态变化的执行容器与根哈希的计算核心，承担实际的状态构建与遍历操作；`state.Database` 封装对账户和合约存储 Trie 的统一访问，并提供合约代码缓存；而最顶层的 `state.StateDB` 是在区块执行过程中与 EVM 对接的接口，提供账户与存储的读缓存和写支持，使得 EVM 无需感知底层 Trie 的复杂结构。
 
