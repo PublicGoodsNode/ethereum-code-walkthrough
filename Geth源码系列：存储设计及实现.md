@@ -607,7 +607,8 @@ HashDB read: 0xe9ce7770c224e563b0c407618b7b7d8614da3d5da89f3960a3bec97e78fc0ae0
 HashDB read: 0x2c7d134997a5c3e0bf47ff347479ee9318826f1c58689b3d9caeac77287c3af8
 ```
 
-总体来说，`PathDB`和`HashDB`均是保持Trie数据结构来存储状态数据，只是`PathDB`以Trie节点的`path`作为key，而`HashDB`则是以Trie节点值对应的hash作为key，两者均存储值相同均为Trie节点的值。
+总体来说，`PathDB`和`HashDB`均是保持Trie数据结构来存储状态数据，只是`PathDB`以Trie节点的`path`作为key，而`HashDB`则是以Trie节点值对应的hash作为key。对于中间节点，**PathDB** 存储 `(path, subpaths)`，而 **HashDB** 存储 `(hash, subhashes)`。对于叶子节点，**PathDB** 存储 `(path, value)`，**HashDB** 存储 `(hash, value)`。这里有一个简单的 Go 示例，演示了 [**PathDB**](https://github.com/dajuguan/lab/blob/main/eth/go/trie/pathdb.go) 和 [**HashDB**](https://github.com/dajuguan/lab/blob/main/eth/go/trie/hashdb.go) 的状态读取、更新和回滚操作。
+
 
 # 5. DB 相关读写操作流程追踪
 
